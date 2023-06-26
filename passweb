@@ -1,0 +1,590 @@
+#!/usr/bin/perl -- # -*-Perl-*-
+
+# MIT License
+#
+# Copyright (c) 2023 Greg Renda
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+use strict;
+
+use constant RESYNC_SECONDS => 60 * 60;
+
+my ($store, $port) = @ARGV;
+
+die "$0: <password-store> <http port>\n" unless -d $store and
+    -r "$store/.gpg-id" and $port;
+
+$store =~ s%/$%%;      # strip trailing /
+
+my $pid = PassWebServer->new($port)->run();
+
+package PassWebServer;
+use base qw(HTTP::Server::Simple::CGI);
+
+use constant DISPATCH =>
+{
+    '/pass' => \&pass,
+    '/view' => \&view,
+    '/edit' => \&edit,
+    '/save' => \&save,
+    '/add' => \&add,
+    '/sync' => \&sync,
+    '/delete' => \&delete,
+    '/rename' => \&rename,
+};
+
+sub new
+{
+    my $class = shift;
+    my $s = $class->SUPER::new(@_);
+
+    $s->{dataPos} = tell DATA;
+    $s->getTree;
+    $s;
+}
+
+sub print_banner {}	# git rid of the default banner
+
+sub handle_request
+{
+     my ($s, $cgi) = @_;
+
+     my $path = $cgi->path_info();
+
+     $path = '/pass' unless exists DISPATCH()->{$path};
+     print "HTTP/1.0 200 OK\r\n";
+     DISPATCH()->{$path}->($s, $cgi);
+}
+
+sub error
+{
+    my ($s, $cgi, $msg) = @_;
+
+    print $cgi->header, $cgi->start_html('Error');
+    print <<END;
+<h1>Error</h1>
+$msg
+END
+    print $cgi->end_html;
+}
+
+sub rename
+{
+    my ($s, $cgi) = @_;
+    (my $path = $cgi->param('path')) =~ s%^/%%;
+
+    print $cgi->header, $cgi->start_html("Rename: $path");
+    print <<END;
+<form action="/pass" method="get">
+  Rename <b>$path</b> to<p>
+  <input type="text" name="rename" value="$path" size="40"/><p>
+  <input type="hidden" name="path" value="$path"/>
+  <input type="submit" value="Rename"/>
+  <button type="button" onclick='window.open("/pass", "_self")'>Cancel</button>
+END
+
+    print $cgi->end_html;
+}
+
+sub git
+{
+    my ($s, $cmd) = @_;
+
+    qx/2>&1 git -C '$store' $cmd/;
+}
+
+sub doSync
+{
+    my $s = shift;
+
+    $s->{lastSync} = time;
+
+    my $result = $s->git('fetch -v');
+    $result .= "\n".$s->git('rebase -v');
+    $result .= "\n".$s->git('push -v');
+    $result;
+}
+
+sub sync
+{
+    my ($s, $cgi) = @_;
+
+    my $result = $s->doSync;
+    print $cgi->header, $cgi->start_html('Sync');
+    print <<END;
+<pre>$result</pre><p>
+<button onclick="window.open('/pass?refresh=1', '_self')">Done</button>
+END
+    print $cgi->end_html;
+}
+
+sub genpass
+{
+    my ($s, $cgi, $len, $nosymbols) = @_;
+    my $chars = '[:alnum:]';
+
+    $chars .= '[:punct:]' unless $nosymbols;
+    qx(dd if=/dev/urandom bs=1 count=1024 status=none | LC_ALL=C tr -dc '$chars' | head -c $len);
+}
+
+sub add
+{
+    my ($s, $cgi) = @_;
+    (my $path = $cgi->param('path')) =~ s%^/%%;
+    my $name = $cgi->param('name');
+    my $len = $cgi->param('len') || 16;
+    my $nosymbols = 'checked' if $cgi->param('nosymbols') eq 'true';
+    my $pass;
+
+    $pass = $s->genpass($cgi, $len, $nosymbols) if $cgi->param('generate');
+    $pass =~ s/"/&quot;/g;
+
+    print $cgi->header, $cgi->start_html("Add: $path");
+    print <<END;
+<script>
+function genPass()
+{
+    var len = document.getElementById("genlen").value;
+    var path = document.getElementById("path").value;
+    var name = document.getElementById("name").value;
+    var nosymbols = document.getElementById("nosymbols").checked;
+
+    window.open("/add?generate=1&path=" + path + "&len=" + len + "&name=" + name + "&nosymbols=" + nosymbols, "_self");
+}
+</script>
+<form action="/save" method="post">
+Path <input type="text" id="path" name="path" value="$path"/>
+Name <input type="text" id="name" name="name" value="$name" placeholder="Name..." />
+<input type="hidden" name="add" value="1"/>
+<p>
+Password <input type="text" name="pwd" value="$pass" size="64"/>
+<button type="button" onclick="genPass()">Generate</button>
+Length <input type="text" id="genlen" value="$len" size="2"/>
+<input type="checkbox" id="nosymbols" name="nosymbols" $nosymbols>
+<label for="nosymbols">No symbols</label>
+<p>
+<textarea name="data" cols="80" rows="10"></textarea>
+<p>
+<button type="submit">Save</button>
+<button type="button" onclick="window.open('/pass', '_self')">Cancel</button>
+</form>
+END
+    print $cgi->end_html;
+}
+
+sub save
+{
+    my ($s, $cgi) = @_;
+    (my $path = $cgi->param('path')) =~ s%^/|/$%%g;
+    my $name = $cgi->param('name');
+    my $password = $cgi->param('pwd');
+    my $data = $cgi->param('data');
+
+    if ($name)
+    {
+	qx%mkdir -p '$store/$path'% if $path;
+	$path = $path ? "$path/$name" : $name;
+	return $s->error($cgi, "$path already exists") if
+	    -d "$store/$path" or -f "$store/${path}.gpg";
+    }
+
+    open my $ids, "$store/.gpg-id" or return
+	$s->error($cgi, "Can't open .gpg-ids");
+
+    my $recipients;
+    $recipients .= '-r '.join(' -r ', map { s/[\r\n]$//gr } <$ids>);
+    close $ids;
+
+    open my $gpg, "|gpg -q -e $recipients > '$store/${path}.gpg'" or
+	$s->error($cgi, "Error writing $path");
+    print $gpg "$password\n$data";
+    close $gpg;
+
+    $s->hashify($path) if $name;	# added a new entry
+
+    my $msg;
+
+    if ($cgi->param('add'))
+    {
+	$s->git("add '${path}.gpg'");
+	$msg = 'added';
+    }
+    else
+    {
+	$msg = 'edited';
+    }
+
+    $s->git("commit -m '$msg $path' '${path}.gpg'");
+    $s->view($cgi, $path);
+}
+
+sub edit
+{
+    my ($s, $cgi) = @_;
+    (my $path = $cgi->param('path')) =~ s%^/%%;
+    my ($pass, $data) = $s->readPass($path);
+    my $len = $cgi->param('len') || 16;
+    my $nosymbols = 'checked' if $cgi->param('nosymbols') eq 'true';
+
+    $pass = $s->genpass($cgi, $len, $nosymbols) if $cgi->param('generate');
+    $pass =~ s/"/&quot;/g;
+
+    print $cgi->header, $cgi->start_html("Edit: $path");
+    print <<END;
+<script>
+function genPass()
+{
+    var len = document.getElementById("genlen").value;
+    var nosymbols = document.getElementById("nosymbols").checked;
+    window.open("/edit?generate=1&path=$path&len=" + len + "&nosymbols=" + nosymbols, "_self");
+}
+</script>
+<h2>$path</h2>
+<form action="/save" method="post">
+Password
+<input type="text" name="pwd" value="$pass" size="64"/>
+<button type="button" onclick="genPass()">Generate</button>
+Length <input type="text" id="genlen" value="$len" size="2"/>
+<input type="checkbox" id="nosymbols" name="nosymbols" $nosymbols>
+<label for="nosymbols">No symbols</label>
+<p>
+<textarea name="data" cols="80" rows="10">$data</textarea>
+<p>
+<input type="hidden" name="path" value="$path"/>
+<button type="submit">Save</button>
+<button type="button" onclick="window.open('/view?path=$path', '_self')">Cancel</button>
+</form>
+END
+    print $cgi->end_html;
+}
+
+sub view
+{
+    my ($s, $cgi, $path) = @_;
+    $path = $cgi->param('path') unless $path;
+    $path =~ s%^/%%;
+    my ($pass, $data) = $s->readPass($path);
+    my $date =
+	qx(git -C '$store' log -1 --date=local --pretty="format:%cd" '$path.gpg');
+
+    print $cgi->header, $cgi->start_html("View: $path");
+    print <<END;
+  <h2 style="display: inline-block">$path</h2>
+  <h5 style="display: inline-block">$date</h5>
+<br>
+Password
+<div style="border: 1px solid black; display: inline-block;">
+    &nbsp;$pass&nbsp;
+</div>
+<button onclick="copyText()">Copy</button>
+<pre>$data</pre>
+<p>
+<button onclick="window.open('/edit?path=$path', '_self')">Edit</button>
+<button onclick="window.open('/rename?path=$path', '_self')">Rename</button>
+<button onclick="window.open('/delete?path=$path', '_self')">Delete</button>
+<button onclick="window.open('/pass', '_self')">Done</button>
+<script>function copyText() { navigator.clipboard.writeText("$pass"); }</script>
+END
+    print $cgi->end_html;
+}
+
+sub delete
+{
+    my ($s, $cgi) = @_;
+    (my $path = $cgi->param('path')) =~ s%^/%%;
+
+    print $cgi->header, $cgi->start_html("Delete: $path");
+    print <<END;
+Delete <b>$path</b><p>
+Are you sure?
+<button type="button" onclick="window.open('/pass?path=$path&delete=1', '_self')">Yes</button>
+<button type="button" onclick="window.open('/view?path=$path', '_self')">Cancel</button>
+END
+
+    print $cgi->end_html;
+}
+
+sub readPass
+{
+    my ($s, $path) = @_;
+
+    open my $gpg, "gpg -q -d $store/'${path}.gpg'|" or die;
+    (my $pass = <$gpg>) =~ s/[\r\n]$//g;
+    my $data;
+    {
+	local $/;
+	$data = <$gpg>;
+    }
+
+    ($pass, $data);
+}
+
+sub pass
+{
+    my ($s, $cgi) = @_;
+    my $refresh = $cgi->param('refresh');
+
+    if ($cgi->param('delete'))
+    {
+	(my $path = $cgi->param('path')) =~ s%^/%%;
+	$s->git("rm '${path}.gpg'");
+	$s->git("commit -m 'deleted $path' '${path}.gpg'");
+	$refresh = 1;
+    }
+    elsif ($cgi->param('rename'))
+    {
+	(my $path = $cgi->param('path')) =~ s%^/%%;
+	(my $rename = $cgi->param('rename')) =~ s%^/|/$%%g;
+
+	if ($rename)
+	{
+	    $s->git("mv '${path}.gpg' '${rename}.gpg'");
+	    $s->git("commit -m 'renamed $path to $rename' '${path}.gpg' '${rename}.gpg'");
+	    $refresh = 1;
+	}
+    }
+
+    $s->doSync if time - $s->{lastSync} > ::RESYNC_SECONDS;
+
+    if ($refresh)
+    {
+	$s->getTree;
+	print $cgi->header, "<script>window.open('/pass', '_self');</script>";
+	return;
+    }
+
+    my $search = $cgi->param('search');
+
+    seek DATA, $s->{dataPos}, 0;
+    print $cgi->header, <DATA>;
+
+    print <<END;
+
+<form action="/pass" method="get">
+  <input type="text" name="search" placeholder="Search..." value="$search"/>
+  <input type="submit" value="Search"/>
+  <button type="button" onclick='window.open("/pass", "_self")'>Clear</button>
+  <button type="button" id="expandButton" onclick="toggleExpand()">Expand</button>
+  <button type="button" onclick='window.open("/pass?expand=1", "_self")'>Show All</button>
+  <button type="button" onclick='window.open("/add?path=" + (typeof selected === "undefined" ? "/" : selected.id), "_self")'>Add</button>
+  <button type="button" onclick='window.open("/sync", "_self")'>Sync</button>
+</form>
+
+<ul id="Tree">
+END
+    my $tree;
+
+    if ($search)
+    {
+	$tree = $s->filterTree($s->{tree}, $search);
+
+	if (!keys %{$tree})
+	{
+	    print '<p style="color:red;">No results found</p>';
+	    $tree = $s->{tree};
+	    undef $search;
+	}
+    }
+    else
+    {
+	$tree = $s->{tree};
+    }
+
+    $s->showTree($tree);
+    print '</ul>';
+
+    print <<END;
+<script>
+var toggler = document.getElementsByClassName("caret");
+var i;
+var selected;
+
+for (i = 0; i < toggler.length; i++) {
+  toggler[i].addEventListener("click", function() {
+    this.parentElement.querySelector(".nested").classList.toggle("active");
+    this.classList.toggle("caret-down");
+
+    if (selected)
+    {
+        selected.style.backgroundColor = "";
+    }
+    this.style.backgroundColor = "lightblue";
+    selected = this;
+  });
+}
+</script>
+END
+
+    print "<script>toggleExpand();</script>" if $search || $cgi->param('expand');
+    print $cgi->end_html;
+}
+
+sub hashify
+{
+    my ($s, $path) = @_;
+
+    my @a = split /\//, $path;
+    my $value = pop @a;
+    my $ref = \$s->{tree};
+    $ref = \$$ref->{$_} for @a;
+    push @{${$ref}->{_files}}, $value;
+}
+
+sub getTree
+{
+    my $s = shift;
+
+    open my $tree, "find $store -name '*.gpg'|" or die;
+
+    $s->{tree} = {};
+
+    while (<$tree>)
+    {
+	s/[\r\n]$//g;
+	s%$store/|\.gpg$%%g;
+	$s->hashify($_);
+    }
+}
+
+sub showTree
+{
+    my ($s, $tree, $path) = @_;
+
+    for (sort { "\L$a" cmp "\L$b" }
+	 grep { ref $tree->{$_} eq 'HASH' } keys %{$tree})
+    {
+	print <<END;
+<li><span class="caret" id="$path/$_">$_</span>
+<ul class="nested">
+END
+	$s->showTree($tree->{$_}, "$path/$_");
+	print '</ul></li>';
+    }
+
+    if (exists $tree->{_files})
+    {
+	print <<END for sort { "\L$a" cmp "\L$b" } @{$tree->{_files}};
+<li>
+  <a href="/"
+    onclick="window.open('/view?path=$path/$_','_self'); return false;">
+    $_
+  </a>
+</li>
+END
+    }
+}
+
+sub filterTree
+{
+    my ($s, $src, $filter) = @_;
+    my $dst = {};
+
+    for (keys %{$src})
+    {
+	if ($_ eq '_files')
+	{
+	    @{$dst->{$_}} = grep { /$filter/i } @{$src->{$_}};
+	    delete $dst->{$_} unless @{$dst->{$_}};
+	}
+	else
+	{
+	    $dst->{$_} = $s->filterTree($src->{$_}, $filter);
+	    delete $dst->{$_} unless keys %{$dst->{$_}};
+	}
+    }
+
+    $dst;
+}
+
+__DATA__
+<!DOCTYPE html
+	PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+	 "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en-US" xml:lang="en-US">
+
+<head>
+<title>Passwords</title>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1" />
+
+<style>
+/* Remove default bullets */
+ul { list-style-type: none; }
+
+/* Style the caret/arrow */
+.caret {
+  cursor: pointer;
+  user-select: none; /* Prevent text selection */
+}
+
+/* Create the caret/arrow with a unicode, and style it */
+.caret::before {
+  content: "\25B6";
+  color: black;
+  display: inline-block;
+  margin-right: 6px;
+}
+
+/* Rotate the caret/arrow icon when clicked on (using JavaScript) */
+.caret-down::before { transform: rotate(90deg); }
+
+/* Hide the nested list */
+.nested { display: none; }
+
+/* Show the nested list when the user clicks on the caret/arrow (with JavaScript) */
+.active { display: block; }
+
+/* remove underlines from links */
+a:link { text-decoration: none; }
+a:visited { text-decoration: none; }
+a:hover { text-decoration: none; }
+a:active { text-decoration: none; }
+</style>
+</head>
+<body>
+
+<script>
+function toggleExpand()
+{
+    var toggler = document.getElementsByClassName("caret");
+    var button = document.getElementById("expandButton");
+    var i;
+
+    if (button.innerHTML == "Expand")
+    {
+	for (i = 0; i < toggler.length; i++)
+	{
+	    toggler[i].classList.add("caret-down");
+	    toggler[i].parentElement.querySelector(".nested").classList.add("active");
+	}
+
+	button.innerHTML = "Collapse";
+    }
+    else
+    {
+	for (i = 0; i < toggler.length; i++)
+	{
+	    toggler[i].classList.remove("caret-down");
+	    toggler[i].parentElement.querySelector(".nested").classList.remove("active");
+	}
+
+	button.innerHTML = "Expand";
+    }
+}
+</script>
