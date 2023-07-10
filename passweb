@@ -28,12 +28,12 @@ use constant RESYNC_SECONDS => 60 * 60;
 
 my ($store, $port) = @ARGV;
 
-die "$0: <password-store> <http port>\n" unless -d $store and
-    -r "$store/.gpg-id" and $port;
-
 $store =~ s%/$%%;      # strip trailing /
 
-my $pid = PassWebServer->new($port)->run();
+die "$0: <password-store> <http port>\n" unless -d $store and $port;
+die "Can't read $store/.gpg-id\n" unless -r "$store/.gpg-id";
+
+PassWebServer->new($port)->run();
 
 package PassWebServer;
 use base qw(HTTP::Server::Simple::CGI);
@@ -60,7 +60,7 @@ sub new
     $s;
 }
 
-sub print_banner {}	# git rid of the default banner
+sub print_banner {}	# get rid of the default banner
 
 sub handle_request
 {
@@ -283,6 +283,7 @@ sub view
     my ($pass, $data) = $s->readPass($path);
     my $date =
 	qx(git -C '$store' log -1 --date=local --pretty="format:%cd" '$path.gpg');
+    (my $clipPass = $pass) =~ s/\\/\\\\/g;
 
     print $cgi->header, $cgi->start_html("View: $path");
     print <<END;
@@ -300,7 +301,7 @@ Password
 <button onclick="window.open('/rename?path=$path', '_self')">Rename</button>
 <button onclick="window.open('/delete?path=$path', '_self')">Delete</button>
 <button onclick="window.open('/pass', '_self')">Done</button>
-<script>function copyText() { navigator.clipboard.writeText("$pass"); }</script>
+<script>function copyText() { navigator.clipboard.writeText('$clipPass'); }</script>
 END
     print $cgi->end_html;
 }
