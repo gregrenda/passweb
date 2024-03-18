@@ -2,7 +2,7 @@
 
 # MIT License
 #
-# Copyright (c) 2023 Greg Renda
+# Copyright (c) 2024 Greg Renda
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -68,6 +68,8 @@ sub handle_request
     $s->{cgi} = $cgi;
     my $path = $s->{cgi}->path_info();
 
+    local $SIG{CHLD} = sub { $?; };
+
     $path = '/pass' unless exists DISPATCH()->{$path};
     print "HTTP/1.0 200 OK\r\n";
     DISPATCH()->{$path}->($s);
@@ -81,6 +83,8 @@ sub error
     print <<END;
 <h1>Error</h1>
 $msg
+<p>
+<button onclick='history.back()'>Back</button>
 END
     print $s->{cgi}->end_html;
 }
@@ -107,7 +111,8 @@ sub git
 {
     my ($s, $cmd) = @_;
 
-    qx/2>&1 git -C '$store' $cmd/;
+    $s->{gitOutput} = qx/2>&1 git -C '$store' $cmd/;
+    !$?;
 }
 
 sub doSync
@@ -116,9 +121,9 @@ sub doSync
 
     $s->{lastSync} = time;
 
-    my $result = $s->git('fetch -v');
-    $result .= "\n".$s->git('rebase -v');
-    $result .= "\n".$s->git('push -v');
+    my $result;
+
+    $s->git("$_ -v"), $result .= $s->{gitOutput} for qw(fetch rebase push);
     $result;
 }
 
@@ -150,6 +155,7 @@ sub add
     my ($path, $urlPath) = $s->getPath;
     my $name = $s->{cgi}->param('name');
     my $len = $s->{cgi}->param('len') || 16;
+    my $data = $s->{cgi}->param('data');
     my $nosymbols = 'checked' if $s->{cgi}->param('nosymbols') eq 'true';
     my $pass;
 
@@ -164,23 +170,24 @@ function genPass()
     var len = document.getElementById("genlen").value;
     var path = document.getElementById("path").value;
     var name = document.getElementById("name").value;
+    var data = document.getElementById("data").value;
     var nosymbols = document.getElementById("nosymbols").checked;
 
-    window.open("/add?generate=1&path=" + encodeURIComponent(path) + "&len=" + len + "&name=" + encodeURIComponent(name) + "&nosymbols=" + nosymbols, "_self");
+    window.open("/add?generate=1&path=" + encodeURIComponent(path) + "&len=" + len + "&name=" + encodeURIComponent(name) + "&nosymbols=" + nosymbols + "&data=" + data, "_self");
 }
 </script>
 <form action="/save" method="post">
-Path <input type="text" id="path" name="path" value="$path"/>
+Path <input type="text" id="path" name="path" value="$path" placeholder="Path..."/>
 Name <input type="text" id="name" name="name" value="$name" placeholder="Name..." />
 <input type="hidden" name="add" value="1"/>
+<input type="checkbox" name="topOk">Add to top level</input>
 <p>
-Password <input type="text" name="pwd" value="$pass" size="64"/>
+Password <input type="text" name="pwd" value="$pass" size="64" placeholder="Password..."/>
 <button type="button" onclick="genPass()">Generate</button>
 Length <input type="text" id="genlen" value="$len" size="2"/>
-<input type="checkbox" id="nosymbols" name="nosymbols" $nosymbols>
-<label for="nosymbols">No symbols</label>
+<input type="checkbox" id="nosymbols" name="nosymbols" $nosymbols>No symbols</input>
 <p>
-<textarea name="data" cols="80" rows="10"></textarea>
+<textarea name="data" id="data" cols="80" rows="10">$data</textarea>
 <p>
 <button type="submit">Save</button>
 <button type="button" onclick="window.open('/pass', '_self')">Cancel</button>
@@ -196,33 +203,39 @@ sub save
     my $name = $s->{cgi}->param('name');
     my $password = $s->{cgi}->param('pwd');
     my $data = $s->{cgi}->param('data');
+    my $add = $s->{cgi}->param('add');
 
-    if ($name)
+    return $s->error("Empty password") if $password =~ /^\s*$/;
+
+    if ($add)
     {
+	return $s->error('No name specified') unless $name;
+	return $s->error("Check the 'Add to top level' box to add to the top level") unless
+	    $path or $s->{cgi}->param('topOk');
+
 	qx%mkdir -p '$store/$path'% if $path;
 	$path = $path ? "$path/$name" : $name;
 	return $s->error("$path already exists") if
 	    -d "$store/$path" or -f "$store/${path}.gpg";
     }
 
-    open my $ids, "$store/.gpg-id" or return
-	$s->error("Can't open .gpg-ids");
+    open my $ids, "$store/.gpg-id" or return $s->error("Can't open .gpg-ids");
 
     my $recipients;
     $recipients .= '-r '.join(' -r ', map { s/[\r\n]$//gr } <$ids>);
     close $ids;
 
+    return $s->error('Empty path') unless $path;
     open my $gpg, "|gpg -q -e $recipients > '$store/${path}.gpg'" or
-	$s->error("Error writing $path");
+	return $s->error("Error writing $path");
     print $gpg "$password\n$data";
     close $gpg;
 
-    $s->hashify($path) if $name;	# added a new entry
-
     my $msg;
 
-    if ($s->{cgi}->param('add'))
+    if ($add)
     {
+	$s->hashify($path);
 	$s->git("add '${path}.gpg'");
 	$msg = 'added';
     }
@@ -240,6 +253,7 @@ sub edit
     my $s = shift;
     my ($path, $urlPath) = $s->getPath;
     my ($pass, $data) = $s->readPass($path);
+    return $s->error("Can't decrypt") unless $pass;
     my $len = $s->{cgi}->param('len') || 16;
     my $nosymbols = 'checked' if $s->{cgi}->param('nosymbols') eq 'true';
 
@@ -291,6 +305,7 @@ sub view
     }
 
     my ($pass, $data) = $s->readPass($path);
+    return $s->error("Can't decrypt") unless $pass;
     my $date =
 	qx(git -C '$store' log -1 --date=local --pretty="format:%cd" '$path.gpg');
     (my $clipPass = $pass) =~ s/\\/\\\\/g;
@@ -365,7 +380,8 @@ sub pass
 
 	if ($rename)
 	{
-	    $s->git("mv '${path}.gpg' '${rename}.gpg'");
+	    $s->git("mv '${path}.gpg' '${rename}.gpg'") or
+		return $s->error("Can't rename '$path' to '$rename'");
 	    $s->git("commit -m 'renamed $path to $rename' '${path}.gpg' '${rename}.gpg'");
 	    $refresh = 1;
 	}
