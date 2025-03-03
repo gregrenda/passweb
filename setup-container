@@ -1,0 +1,70 @@
+#!/bin/sh
+
+GIT_SSH_KEY=git-private-key
+GIT_USER="User Name"
+GIT_EMAIL=email@example.com
+GIT_REPO=git:password-store.git
+
+if [ -z "$SETUP" ]; then
+   podman volume rm passweb > /dev/null
+
+   podman run --rm							      \
+       -v passweb:/home/passweb						      \
+       -v ./setup-container:/usr/local/bin/setup			      \
+       -v ~/.gnupg:/gnupg:ro						      \
+       -v ~/.ssh:/ssh:ro						      \
+       -e SETUP=root							      \
+       passweb /usr/local/bin/setup
+
+   podman run --rm -it							      \
+       -v passweb:/home/passweb						      \
+       -v ./setup-container:/usr/local/bin/setup			      \
+       -e SETUP=user							      \
+       -u passweb							      \
+       passweb /usr/local/bin/setup
+
+   exit
+fi
+
+cd ~passweb
+
+# root setup
+if [ "$SETUP" = root ]; then
+   cp -r /gnupg .gnupg
+   mkdir .ssh
+   cp "/ssh/$GIT_SSH_KEY" .ssh/git
+
+   chown -R passweb:passweb .
+
+# user setup
+elif [ "$SETUP" = user ]; then
+   cat <<END > .gitconfig
+[user]
+        name = $GIT_USER
+        email = $GIT_EMAIL
+END
+
+# add any extra ssh configuration for git below
+   cat <<END > .ssh/config
+host git
+    IdentityFile ~/.ssh/git
+END
+
+   cat <<END > .gnupg/gpg-agent.conf
+max-cache-ttl 1
+END
+
+   cat <<'END' > agent
+#!/bin/sh
+
+AGENT=/tmp/agent
+
+ssh-agent > $AGENT
+. $AGENT > /dev/null
+ssh-add ~/.ssh/git
+END
+
+   chmod +x agent
+
+   git clone $GIT_REPO
+fi
