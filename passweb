@@ -552,6 +552,10 @@ sub filterTree
 	    @{$dst->{$_}} = grep { /$filter/i } @{$src->{$_}};
 	    delete $dst->{$_} unless @{$dst->{$_}};
 	}
+	elsif (/$filter/i)	# match directory
+	{
+	    $dst->{$_} = $src->{$_};
+	}
 	else
 	{
 	    $dst->{$_} = $s->filterTree($src->{$_}, $filter);
