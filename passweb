@@ -243,6 +243,8 @@ sub save
     my $add = $s->{cgi}->param('add');
 
     return $s->error("Empty password") if $password =~ /^\s*$/;
+    return $s->error("Can't use apostrophe in name") if $name =~ /'/;
+    return $s->error("Can't use apostrophe in path") if $path =~ /'/;
 
     if ($add)
     {
@@ -410,6 +412,8 @@ sub pass
 
 	if ($rename)
 	{
+	    return $s->error("Can't use apostrophe in name") if $rename =~ /'/;
+
 	    my ($dir) = ($rename =~ m%(.+)/%) || '';
 	    qx%mkdir -p "$store/$dir"% if $dir and !-d "$store/$dir";
 
